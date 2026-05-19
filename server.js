@@ -1,14 +1,22 @@
+const http = require('http');
 const { WebSocketServer } = require('ws');
 
-// Render assigne un port dynamiquement, sinon on utilise 10000 en local
 const PORT = process.env.PORT || 10000;
-const wss = new WebSocketServer({ port: PORT });
+
+// 1. Serveur HTTP de base pour rassurer le "Health Check" de Render
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Serveur Relais Recall Royale Actif 🟢');
+});
+
+// 2. On attache le serveur WebSocket par-dessus
+const wss = new WebSocketServer({ server });
 
 let hostWs = null;
 let controllers = {}; // Liste des manettes: { id -> { ws, name, color } }
 let nextId = 1;
 
-console.log(`🚀 Serveur Node.js WebSocket démarré sur le port ${PORT}`);
+console.log(`🚀 Démarrage du serveur...`);
 
 wss.on('connection', (ws) => {
     console.log("📡 Nouvelle connexion entrante...");
@@ -28,11 +36,9 @@ wss.on('connection', (ws) => {
                     controllers[playerId] = { ws, name: data.name, color: data.color };
                     console.log(`🎮 Manette connectée: ${data.name} (ID: ${playerId})`);
 
-                    // Le serveur répond directement à la manette
                     ws.send(JSON.stringify({ type: 'assign_id', id: playerId }));
                     ws.send(JSON.stringify({ type: 'player_color', color: data.color }));
 
-                    // Le serveur prévient le Jeu Principal qu'un joueur a rejoint
                     if (hostWs && hostWs.readyState === 1) {
                         hostWs.send(JSON.stringify({
                             type: 'player_joined',
@@ -47,13 +53,11 @@ wss.on('connection', (ws) => {
 
             // 2. Le Jeu Principal (Host) parle aux Manettes
             if (ws === hostWs) {
-                // S'il veut parler à tout le monde
                 if (data.target === 'all') {
                     Object.values(controllers).forEach(c => {
                         if (c.ws.readyState === 1) c.ws.send(JSON.stringify(data.payload));
                     });
                 }
-                // S'il veut parler à une manette spécifique
                 else if (data.target && controllers[data.target]) {
                     const targetWs = controllers[data.target].ws;
                     if (targetWs.readyState === 1) {
@@ -63,8 +67,7 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            // 3. Les Manettes parlent au Jeu Principal (input, saboteur_choice...)
-            // On identifie qui parle
+            // 3. Les Manettes parlent au Jeu Principal
             let senderId = null;
             for (const [id, c] of Object.entries(controllers)) {
                 if (c.ws === ws) {
@@ -74,13 +77,12 @@ wss.on('connection', (ws) => {
             }
 
             if (senderId && hostWs && hostWs.readyState === 1) {
-                // On ajoute l'ID pour que le Jeu sache qui a envoyé le message
                 data.peer_id = parseInt(senderId);
                 hostWs.send(JSON.stringify(data));
             }
 
         } catch (err) {
-            console.error("Erreur de parsing JSON:", err);
+            console.error("Erreur JSON:", err);
         }
     });
 
@@ -90,7 +92,6 @@ wss.on('connection', (ws) => {
             console.log("🖥️ Le Jeu Principal a été déconnecté.");
             hostWs = null;
         } else {
-            // Chercher la manette qui s'est déconnectée
             for (const [id, c] of Object.entries(controllers)) {
                 if (c.ws === ws) {
                     console.log(`❌ Manette déconnectée (ID: ${id})`);
@@ -103,4 +104,9 @@ wss.on('connection', (ws) => {
             }
         }
     });
+});
+
+// 3. On écoute sur le port assigné par Render
+server.listen(PORT, () => {
+    console.log(`✅ Serveur HTTP et WebSocket actifs sur le port ${PORT}`);
 });
