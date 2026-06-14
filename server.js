@@ -1,331 +1,162 @@
-<script src="joy.js"></script>
-<script>
-// ── State ──────────────────────────────────────────────────
-let ws          = null;
-let joyX        = 0, joyY = 0;
-let playerName = '';
-let playerColor = '#7c3aed';
-let sabTiles   = [];
-let sabChosen  = null;
-let GRID_COLS  = 8;
-let GRID_ROWS  = 5;
-let tutorialMode = '';
+const http = require('http');
+const { WebSocketServer } = require('ws');
 
-// ── Récupération des paramètres de l'URL ──────────
-const urlParams = new URLSearchParams(window.location.search);
-const serverParam = urlParams.get('server');
-const roomParam = urlParams.get('room') ? urlParams.get('room').toUpperCase() : '';
+const PORT = process.env.PORT || 10000;
 
-// CORRECTION SÉCURISÉE : On vérifie si l'élément existe avant de changer son texte
-const roomTitleEl = document.getElementById('lobby-room-title') || document.querySelector('.lobby-title');
-if (roomTitleEl && roomParam) {
-  roomTitleEl.textContent = `CTRL//PAD [${roomParam}]`;
-}
+// 1. Serveur HTTP de base pour rassurer le "Health Check" de Render
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Serveur Relais Multi-Rooms Recall Royale Actif 🟢');
+});
 
-// ── Screen helper ──────────────────────────────────────────
-function showScreen(id) {
-  const targetScreen = document.getElementById(id);
-  if (targetScreen) {
-    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-    targetScreen.classList.add('active');
-  }
-}
+// 2. On attache le serveur WebSocket par-dessus
+const wss = new WebSocketServer({ server });
 
-const tutorialHint = document.getElementById('tutorial-hint');
-function showTutorialHint(text) {
-  if (tutorialHint) {
-    tutorialHint.textContent = text || '';
-    tutorialHint.style.display = text ? 'block' : 'none';
-  }
-}
+// NOUVEAU : Structure de stockage par salon (Room)
+// Chaque clé sera un code de room (ex: "XFGT") contenant son host et ses manettes
+let rooms = {}; 
+let nextId = 1;
 
-// ── Lobby ──────────────────────────────────────────────────
-const nameInput = document.getElementById('name-input');
-const joinBtn   = document.getElementById('join-btn');
-const colorInput = document.getElementById('color-input');
+console.log(`🚀 Démarrage du serveur multi-rooms...`);
 
-function darkenHex(hex, amount = 0.45) {
-  const clean = (hex || '#7c3aed').replace('#', '');
-  const int = parseInt(clean, 16);
-  const r = Math.max(0, Math.min(255, Math.floor(((int >> 16) & 255) * (1 - amount))));
-  const g = Math.max(0, Math.min(255, Math.floor(((int >> 8) & 255) * (1 - amount))));
-  const b = Math.max(0, Math.min(255, Math.floor((int & 255) * (1 - amount))));
-  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
-}
+wss.on('connection', (ws) => {
+    // On attache des propriétés personnalisées au socket pour s'en souvenir lors de la déconnexion
+    ws.myRole = null;
+    ws.myRoomCode = null;
+    ws.myPlayerId = null;
 
-function applyThemeColor(hex) {
-  const root = document.documentElement;
-  root.style.setProperty('--accent', hex);
-  root.style.setProperty('--cyan', hex);
-}
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
 
-// Sécurisation des écouteurs d'événements pour éviter les plantages si le HTML change
-if (colorInput) {
-  colorInput.addEventListener('input', () => {
-    playerColor = colorInput.value;
-    applyThemeColor(playerColor);
-  });
-}
+            // 1. Gérer les enregistrements (Register)
+            if (data.type === 'register') {
+                const roomCode = data.room ? data.room.toUpperCase() : null;
 
-if (nameInput && joinBtn) {
-  nameInput.addEventListener('input', () => {
-    joinBtn.disabled = nameInput.value.trim().length === 0;
-  });
-  
-  nameInput.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !joinBtn.disabled) joinGame();
-  });
-}
+                if (!roomCode) {
+                    console.log("⚠️ Tentative de connexion sans code de session spécifié.");
+                    return;
+                }
 
-if (joinBtn) {
-  joinBtn.addEventListener('click', joinGame);
-}
+                ws.myRoomCode = roomCode;
 
-function joinGame() {
-  if (!nameInput) return;
-  playerName = nameInput.value.trim();
-  if (!playerName) return;
-  
-  playerColor = (colorInput ? colorInput.value : '#7c3aed');
-  applyThemeColor(playerColor);
-  
-  const pLabel = document.getElementById('player-label');
-  const wLabel = document.getElementById('waiting-label');
-  if (pLabel) pLabel.textContent = playerName.toUpperCase();
-  if (wLabel) wLabel.textContent = playerName.toUpperCase();
-  
-  showScreen('game');
-  initJoystick();
-  connect();
-}
+                // ── CAS 1 : C'est le Jeu Principal (Host) ──
+                if (data.role === 'host') {
+                    ws.myRole = 'host';
+                    
+                    // Si la room n'existe pas, on la crée
+                    if (!rooms[roomCode]) {
+                        rooms[roomCode] = { hostWs: null, controllers: {} };
+                    }
+                    
+                    rooms[roomCode].hostWs = ws;
+                    console.log(`🖥️ Salon [${roomCode}] : Jeu Principal (Host) connecté !`);
+                } 
+                
+                // ── CAS 2 : C'est une Manette (Controller) ──
+                else if (data.role === 'controller') {
+                    ws.myRole = 'controller';
+                    const playerId = nextId++;
+                    ws.myPlayerId = playerId;
 
-// ── Joystick ───────────────────────────────────────────────
-let joyInited = false;
-function initJoystick() {
-  if (joyInited) return;
-  
-  // On s'assure que la div du joystick existe bel et bien
-  if (!document.getElementById('joyDiv')) return;
-  
-  joyInited = true;
-  const stroke = darkenHex(playerColor, 0.45);
-  
-  new JoyStick('joyDiv', {
-    internalFillColor: playerColor, internalStrokeColor: stroke,
-    externalStrokeColor: '#2d2d4e', autoReturnToCenter: true
-  }, function(s) {
-    joyX = parseInt(s.x); joyY = parseInt(s.y);
-    const dispX = document.getElementById('disp-x');
-    const dispY = document.getElementById('disp-y');
-    if (dispX) dispX.textContent = joyX;
-    if (dispY) dispY.textContent = joyY;
-  });
-}
+                    // Si le salon n'existe pas encore (la manette est en avance sur l'hôte)
+                    if (!rooms[roomCode]) {
+                        rooms[roomCode] = { hostWs: null, controllers: {} };
+                    }
 
-// ── WebSocket ──────────────────────────────────────────────
-function getWsUrl() {
-  return serverParam || 'wss://recall-royale-server-xqz6.onrender.com';
-}
+                    rooms[roomCode].controllers[playerId] = { ws, name: data.name, color: data.color };
+                    console.log(`🎮 Salon [${roomCode}] : Manette connectée -> ${data.name} (ID: ${playerId})`);
 
-const dotEl    = document.getElementById('dot');
-const statusEl = document.getElementById('status-text');
+                    // Envoyer les identifiants à la manette
+                    ws.send(JSON.stringify({ type: 'assign_id', id: playerId }));
+                    ws.send(JSON.stringify({ type: 'player_color', color: data.color }));
 
-function setStatus(s) {
-  if (dotEl) dotEl.classList.toggle('on', s === 'connected');
-  if (statusEl) statusEl.textContent = s === 'connected' ? 'ONLINE' : s === 'connecting' ? 'CONNECTING…' : 'OFFLINE';
-}
+                    // Alerter l'hôte de ce salon spécifique
+                    const currentRoom = rooms[roomCode];
+                    if (currentRoom.hostWs && currentRoom.hostWs.readyState === 1) {
+                        currentRoom.hostWs.send(JSON.stringify({
+                            type: 'player_joined',
+                            peer_id: playerId,
+                            player_name: data.name,
+                            player_color: data.color
+                        }));
+                    }
+                }
+                return;
+            }
 
-function connect() {
-  setStatus('connecting');
-  ws = new WebSocket(getWsUrl());
-  
-  ws.onopen = () => {
-    setStatus('connected');
-    console.log(`📡 Connecté au serveur relais. Room: ${roomParam}`);
-    
-    ws.send(JSON.stringify({ 
-      type: 'register', 
-      role: 'controller', 
-      name: playerName, 
-      color: playerColor,
-      room: roomParam 
-    }));
-  };
-  
-  ws.onmessage = e => { 
-    try { 
-      handleServerMessage(JSON.parse(e.data)); 
-    } catch(err) {
-      console.error("Erreur lecture message serveur:", err);
-    } 
-  };
-  
-  ws.onclose = () => { setStatus('offline'); ws = null; };
-  ws.onerror = () => { setStatus('offline'); ws = null; };
-}
+            // Récupérer le salon associé à la connexion actuelle
+            const roomCode = ws.myRoomCode;
+            const currentRoom = rooms[roomCode];
+            if (!currentRoom) return;
 
-// ── Handle messages from Godot ─────────────────────────────
-function handleServerMessage(msg) {
-  console.log('📨 Received:', msg.type, msg);
-  
-  const sabConfirm = document.getElementById('sab-confirm');
-  const sabTitle = document.getElementById('sab-title');
-  const sabSub = document.getElementById('sab-sub');
-  const lobbyScreen = document.getElementById('lobby');
+            // 2. Le Jeu Principal (Host) parle aux Manettes de SA room
+            if (ws.myRole === 'host') {
+                if (data.target === 'all') {
+                    Object.values(currentRoom.controllers).forEach(c => {
+                        if (c.ws.readyState === 1) c.ws.send(JSON.stringify(data.payload));
+                    });
+                }
+                else if (data.target && currentRoom.controllers[data.target]) {
+                    const targetWs = currentRoom.controllers[data.target].ws;
+                    if (targetWs.readyState === 1) {
+                        targetWs.send(JSON.stringify(data.payload));
+                    }
+                }
+                return;
+            }
 
-  switch (msg.type) {
-    case 'assign_id':
-      console.log('✅ Assigned player ID:', msg.id);
-      break;
+            // 3. Les Manettes parlent au Jeu Principal de LEUR room
+            if (ws.myRole === 'controller' && ws.myPlayerId) {
+                const hostWs = currentRoom.hostWs;
+                if (hostWs && hostWs.readyState === 1) {
+                    data.peer_id = parseInt(ws.myPlayerId);
+                    hostWs.send(JSON.stringify(data));
+                }
+            }
 
-    case 'player_color':
-      if (msg.color) {
-        playerColor = msg.color;
-        applyThemeColor(playerColor);
-      }
-      break;
+        } catch (err) {
+            console.error("Erreur de traitement du message :", err);
+        }
+    });
 
-    case 'tutorial_move_start':
-      tutorialMode = 'move';
-      showScreen('game');
-      showTutorialHint(msg.text || 'Tutoriel: bouge ton joystick pour continuer');
-      break;
+    // 4. Gérer les déconnexions de manière ciblée
+    ws.on('close', () => {
+        const roomCode = ws.myRoomCode;
+        const currentRoom = rooms[roomCode];
 
-    case 'tutorial_sabotage_start':
-      tutorialMode = 'sabotage';
-      sabChosen = null;
-      if (sabConfirm) sabConfirm.textContent = '';
-      if (sabTitle) sabTitle.textContent = 'EXERCICE SABOTAGE';
-      if (sabSub) sabSub.innerHTML = 'Choisis n\'importe quelle case.<br/>Cet exercice n\'active aucun piège.';
-      buildSaboteurGrid(msg.tiles || [], msg.cols || GRID_COLS, msg.rows || GRID_ROWS);
-      showScreen('saboteur-grid-screen');
-      showTutorialHint('Tutoriel: tape une case pour valider');
-      break;
+        if (!currentRoom) return;
 
-    case 'tutorial_sabotage_ack':
-      if (sabConfirm) sabConfirm.textContent = 'Exercice validé (piège non actif)';
-      break;
+        if (ws.myRole === 'host') {
+            console.log(`🖥️ Salon [${roomCode}] : Le Jeu Principal a été déconnecté.`);
+            currentRoom.hostWs = null;
+            
+            // Optionnel : Si plus aucun joueur n'est là et l'hôte est parti, on nettoie la room
+            if (Object.keys(currentRoom.controllers).length === 0) {
+                delete rooms[roomCode];
+            }
+        } 
+        else if (ws.myRole === 'controller' && ws.myPlayerId) {
+            const id = ws.myPlayerId;
+            if (currentRoom.controllers[id]) {
+                console.log(`❌ Salon [${roomCode}] : Manette déconnectée (ID: ${id})`);
+                
+                if (currentRoom.hostWs && currentRoom.hostWs.readyState === 1) {
+                    currentRoom.hostWs.send(JSON.stringify({ type: 'player_left', peer_id: parseInt(id) }));
+                }
+                
+                delete currentRoom.controllers[id];
+            }
 
-    case 'tutorial_clear':
-      tutorialMode = '';
-      if (sabTitle) sabTitle.textContent = 'FAIS TOMBER UNE CASE !';
-      if (sabSub) sabSub.innerHTML = 'Cases <span style="color:#f59e0b">⭐ jaunes</span> = bonnes réponses.<br/>Choisis-en une pour la sabotager !';
-      showTutorialHint('');
-      if (lobbyScreen && !lobbyScreen.classList.contains('active')) {
-        showScreen('game');
-      }
-      break;
+            // Si le salon est complètement vide (plus d'hôte ni de manette), on le supprime de la mémoire
+            if (!currentRoom.hostWs && Object.keys(currentRoom.controllers).length === 0) {
+                delete rooms[roomCode];
+            }
+        }
+    });
+});
 
-    case 'eliminated':
-      showScreen('waiting');
-      break;
-
-    case 'you_are_saboteur':
-      sabChosen = null;
-      if (sabConfirm) sabConfirm.textContent = '';
-      showScreen('saboteur-announced');
-      break;
-
-    case 'saboteur_map':
-      buildSaboteurGrid(msg.tiles, GRID_COLS, GRID_ROWS);
-      showScreen('saboteur-grid-screen');
-      break;
-
-    case 'saboteur_reset':
-      sabChosen = null;
-      if (sabConfirm) sabConfirm.textContent = '';
-      showScreen('waiting');
-      break;
-    
-    case 'new_game':
-      tutorialMode = '';
-      sabChosen = null;
-      joyX = 0;
-      joyY = 0;
-      showTutorialHint('');
-      showScreen('game');
-      break;
-  }
-}
-
-// ── Saboteur grid ──────────────────────────────────────────
-function buildSaboteurGrid(correctTiles, cols, rows) {
-  GRID_COLS = cols;
-  GRID_ROWS = rows;
-
-  const grid = document.getElementById('sab-grid');
-  if (!grid) return;
-  
-  grid.innerHTML = '';
-  grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-
-  const available = Math.min(window.innerWidth - 24, window.innerHeight - 220);
-  const tileSize  = Math.floor(Math.min(available / cols, available / rows)) - 6;
-  grid.style.gridTemplateRows = `repeat(${rows}, ${tileSize}px)`;
-
-  const correctSet = new Set(correctTiles.map(t => `${t.x},${t.y}`));
-  const allowAll = tutorialMode === 'sabotage';
-
-  sabTiles = [];
-  for (let y = 0; y < rows; y++) {
-    for (let x = 0; x < cols; x++) {
-      const isCorrect = correctSet.has(`${x},${y}`);
-      const canPick = allowAll || isCorrect;
-      const tile      = document.createElement('div');
-      tile.className  = 'sab-tile' + (isCorrect ? ' correct' : '');
-      tile.style.width  = tileSize + 'px';
-      tile.style.height = tileSize + 'px';
-      tile.dataset.gx = x;
-      tile.dataset.gy = y;
-      tile.textContent = allowAll ? '' : (isCorrect ? '⭐' : '');
-
-      if (canPick) {
-        tile.addEventListener('touchstart', onTilePick, { passive: false });
-        tile.addEventListener('mousedown',  onTilePick);
-      }
-
-      grid.appendChild(tile);
-      sabTiles.push({ gx: x, gy: y, correct: isCorrect, el: tile });
-    }
-  }
-}
-
-function onTilePick(e) {
-  e.preventDefault();
-  if (sabChosen) return;
-
-  const gx = parseInt(e.currentTarget.dataset.gx);
-  const gy = parseInt(e.currentTarget.dataset.gy);
-  sabChosen = { gx, gy };
-
-  sabTiles.forEach(t => {
-    if (t.gx === gx && t.gy === gy) {
-      t.el.classList.remove('correct');
-      t.el.classList.add('chosen');
-      t.el.textContent = tutorialMode === 'sabotage' ? '✅' : '💥';
-    }
-  });
-
-  const sabConfirm = document.getElementById('sab-confirm');
-  if (tutorialMode === 'sabotage') {
-    if (sabConfirm) sabConfirm.textContent = 'Exercice validé (piège non actif)';
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'tutorial_sabotage_tap', gx, gy }));
-    }
-    return;
-  }
-
-  if (sabConfirm) sabConfirm.textContent = `CASE (${gx},${gy}) SABOTÉE !`;
-
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'saboteur_choice', gx, gy }));
-  }
-}
-
-// ── Send joystick ~30fps ───────────────────────────────────
-function sendInput() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type: 'input', x: joyX, y: joyY }));
-}
-setInterval(sendInput, 33);
-</script>
+// 3. On écoute sur le port assigné par Render
+server.listen(PORT, () => {
+    console.log(`✅ Serveur de salons actifs sur le port ${PORT}`);
+});
